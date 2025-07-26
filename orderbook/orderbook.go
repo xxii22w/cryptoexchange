@@ -4,8 +4,18 @@ import (
 	"fmt"
 	"math/rand"
 	"sort"
+	"sync"
 	"time"
+
+	"github.com/sirupsen/logrus"
 )
+
+type Trade struct {
+	Price     float64
+	Size      float64
+	Bid       bool
+	Timestamp int64
+}
 
 type Match struct {
 	Ask        *Order
@@ -16,6 +26,7 @@ type Match struct {
 
 type Order struct {
 	ID        int64
+	UserID    int64
 	Size      float64
 	Bid       bool
 	Limit     *Limit
@@ -28,8 +39,9 @@ func (o Orders) Len() int           { return len(o) }
 func (o Orders) Swap(i, j int)      { o[i], o[j] = o[j], o[i] }
 func (o Orders) Less(i, j int) bool { return o[i].Timestamp < o[j].Timestamp }
 
-func NewOrder(bid bool, size float64) *Order {
+func NewOrder(bid bool, size float64, userID int64) *Order {
 	return &Order{
+		UserID:    userID,
 		ID:        int64(rand.Intn(10000000)),
 		Size:      size,
 		Bid:       bid,
@@ -38,7 +50,14 @@ func NewOrder(bid bool, size float64) *Order {
 }
 
 func (o *Order) String() string {
-	return fmt.Sprintf("[size: %.2f]", o.Size)
+	return fmt.Sprintf("[size: %.2f] | [id: %d]", o.Size, o.ID)
+}
+
+func (o *Order) Type() string {
+	if o.Bid {
+		return "BID"
+	}
+	return "ASK"
 }
 
 func (o *Order) IsFilled() bool {
@@ -99,6 +118,10 @@ func (l *Limit) Fill(o *Order) []Match {
 	)
 
 	for _, order := range l.Orders {
+		if o.IsFilled() {
+			break
+		}
+
 		match := l.fillOrder(order, o)
 		matches = append(matches, match)
 
@@ -108,9 +131,6 @@ func (l *Limit) Fill(o *Order) []Match {
 			ordersToDelete = append(ordersToDelete, order)
 		}
 
-		if o.IsFilled() {
-			break
-		}
 	}
 
 	for _, order := range ordersToDelete {
@@ -157,6 +177,9 @@ type Orderbook struct {
 	asks []*Limit
 	bids []*Limit
 
+	Trades []*Trade
+
+	mu        sync.RWMutex
 	AskLimits map[float64]*Limit
 	BidLimits map[float64]*Limit
 	Orders    map[int64]*Order
@@ -166,6 +189,7 @@ func NewOrderbook() *Orderbook {
 	return &Orderbook{
 		asks:      []*Limit{},
 		bids:      []*Limit{},
+		Trades:    []*Trade{},
 		AskLimits: make(map[float64]*Limit),
 		BidLimits: make(map[float64]*Limit),
 		Orders:    make(map[int64]*Order),
@@ -173,6 +197,9 @@ func NewOrderbook() *Orderbook {
 }
 
 func (ob *Orderbook) PlaceMarketOrder(o *Order) []Match {
+	ob.mu.Lock()
+	defer ob.mu.Unlock()
+
 	matches := []Match{}
 
 	if o.Bid {
@@ -185,7 +212,7 @@ func (ob *Orderbook) PlaceMarketOrder(o *Order) []Match {
 			matches = append(matches, limitMatches...)
 
 			if len(limit.Orders) == 0 {
-				ob.clearLimit(true, limit)
+				ob.clearLimit(false, limit)
 			}
 
 		}
@@ -204,11 +231,28 @@ func (ob *Orderbook) PlaceMarketOrder(o *Order) []Match {
 		}
 	}
 
+	for _,match := range matches {
+		trade := &Trade{
+			Price: match.Price,
+			Size: match.SizeFilled,
+			Timestamp: time.Now().UnixNano(),
+			Bid: o.Bid,
+		}
+		ob.Trades = append(ob.Trades, trade)
+	}
+
+	logrus.WithFields(logrus.Fields{
+		"currentPrice": ob.Trades[len(ob.Trades)-1].Price,
+	}).Info()
+
 	return matches
 }
 
 func (ob *Orderbook) PlaceLimitOrder(price float64, o *Order) {
 	var limit *Limit
+
+	ob.mu.Lock()
+	defer ob.mu.Unlock()
 
 	if o.Bid {
 		limit = ob.BidLimits[price]
@@ -227,6 +271,13 @@ func (ob *Orderbook) PlaceLimitOrder(price float64, o *Order) {
 			ob.AskLimits[price] = limit
 		}
 	}
+
+	logrus.WithFields(logrus.Fields{
+		"price": limit.Price,
+		"type": o.Type(),
+		"size": o.Size,
+		"userID": o.UserID,
+	}).Info("new limit order")
 
 	ob.Orders[o.ID] = o
 	limit.AddOrder(o)
@@ -250,12 +301,18 @@ func (ob *Orderbook) clearLimit(bid bool, l *Limit) {
 			}
 		}
 	}
+
+	fmt.Printf("clearing limit price level [%.2f]\n", l.Price)
 }
 
 func (ob *Orderbook) CancelOrder(o *Order) {
 	limit := o.Limit
 	limit.DeleteOrder(o)
 	delete(ob.Orders, o.ID)
+
+	if len(limit.Orders) == 0{
+		ob.clearLimit(o.Bid,limit)
+	}
 }
 
 func (ob *Orderbook) BidTotalVolume() float64 {
